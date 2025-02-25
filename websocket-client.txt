@@ -1,0 +1,336 @@
+// websocket_client.h - WebSocket client interface
+
+#pragma once
+
+#include "common.h"
+#include "logging.h"
+
+#include <string>
+#include <functional>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <libwebsockets.h>
+#include <json/json.h>
+#include <chrono>
+
+// Callback function type for tick data
+using TickDataCallback = std::function<void(const TradeData&)>;
+
+// WebSocket client class
+class WebSocketClient {
+public:
+    WebSocketClient(const std::string& url, 
+                    const std::string& symbol,
+                    int reconnectIntervalMs = 5000,
+                    int maxReconnectAttempts = 10) 
+        : m_url(url), 
+          m_symbol(symbol),
+          m_reconnectIntervalMs(reconnectIntervalMs),
+          m_maxReconnectAttempts(maxReconnectAttempts),
+          m_isConnected(false),
+          m_shouldRun(false),
+          m_reconnectCount(0)
+    {
+        // Parse URL to extract host, port, path
+        parseUrl(url);
+    }
+    
+    ~WebSocketClient() {
+        disconnect();
+    }
+    
+    // Set callback for receiving tick data
+    void setTickDataCallback(TickDataCallback callback) {
+        m_tickDataCallback = callback;
+    }
+    
+    // Connect to WebSocket server
+    void connect() {
+        if (m_shouldRun) {
+            return;
+        }
+        
+        m_shouldRun = true;
+        m_reconnectCount = 0;
+        
+        // Start WebSocket client thread
+        m_wsThread = std::thread(&WebSocketClient::runWebSocketClient, this);
+    }
+    
+    // Disconnect from WebSocket server
+    void disconnect() {
+        if (!m_shouldRun) {
+            return;
+        }
+        
+        LOG_INFO("Disconnecting WebSocket for {}", m_symbol);
+        m_shouldRun = false;
+        
+        // Wait for WebSocket thread to finish
+        if (m_wsThread.joinable()) {
+            m_wsThread.join();
+        }
+        
+        m_isConnected = false;
+    }
+    
+    // Check if WebSocket is connected
+    bool isConnected() const {
+        return m_isConnected;
+    }
+    
+    // Check if WebSocket should reconnect
+    bool shouldReconnect() const {
+        return m_reconnectCount < m_maxReconnectAttempts;
+    }
+    
+    // Get symbol
+    const std::string& getSymbol() const {
+        return m_symbol;
+    }
+    
+private:
+    // WebSocket callback implementation (static method for libwebsockets)
+    static int wsCallback(struct lws* wsi, enum lws_callback_reasons reason, 
+                         void* user, void* in, size_t len) {
+        auto* instance = static_cast<WebSocketClient*>(lws_context_user(lws_get_context(wsi)));
+        if (!instance) {
+            return 0;
+        }
+        
+        return instance->handleWebSocketCallback(wsi, reason, user, in, len);
+    }
+    
+    // Handle WebSocket callback (instance method)
+    int handleWebSocketCallback(struct lws* wsi, enum lws_callback_reasons reason, 
+                               void* user, void* in, size_t len) {
+        switch (reason) {
+            case LWS_CALLBACK_CLIENT_ESTABLISHED:
+                LOG_INFO("WebSocket connected to {} for {}", m_url, m_symbol);
+                m_isConnected = true;
+                m_reconnectCount = 0;
+                break;
+                
+            case LWS_CALLBACK_CLIENT_RECEIVE: {
+                std::string message(static_cast<char*>(in), len);
+                LOG_DEBUG("Received message from {}: {}", m_symbol, message);
+                
+                try {
+                    processMessage(message);
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Error processing message: {}", e.what());
+                }
+                break;
+            }
+            
+            case LWS_CALLBACK_CLIENT_CLOSED:
+                LOG_WARNING("WebSocket disconnected from {} for {}", m_url, m_symbol);
+                m_isConnected = false;
+                break;
+                
+            case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+                LOG_ERROR("WebSocket connection error for {}: {}", 
+                          m_symbol, in ? static_cast<char*>(in) : "unknown error");
+                m_isConnected = false;
+                break;
+                
+            default:
+                break;
+        }
+        
+        return 0;
+    }
+    
+    // Parse WebSocket URL
+    void parseUrl(const std::string& url) {
+        // Simple URL parser for wss://host:port/path format
+        std::string protocol = url.substr(0, url.find("://"));
+        m_isSecure = (protocol == "wss");
+        
+        std::string temp = url.substr(url.find("://") + 3);
+        std::string hostPort = temp.substr(0, temp.find("/"));
+        m_path = temp.substr(temp.find("/"));
+        
+        // Split host and port
+        if (hostPort.find(":") != std::string::npos) {
+            m_host = hostPort.substr(0, hostPort.find(":"));
+            m_port = std::stoi(hostPort.substr(hostPort.find(":") + 1));
+        } else {
+            m_host = hostPort;
+            m_port = m_isSecure ? 443 : 80;
+        }
+    }
+    
+    // Process incoming WebSocket message
+    void processMessage(const std::string& message) {
+        Json::CharReaderBuilder reader;
+        Json::Value root;
+        std::istringstream rawStream(message);
+        std::string errs;
+        
+        if (!Json::parseFromStream(reader, rawStream, &root, &errs)) {
+            LOG_ERROR("Failed to parse JSON message: {}", errs);
+            return;
+        }
+        
+        // Extract trade data
+        try {
+            double price = std::stod(root["p"].asString());
+            double volume = std::stod(root["q"].asString());
+            bool isBuyerMaker = root["m"].asBool();
+            int64_t timestamp = root["T"].asInt64() / 1000; // Convert ms to sec
+            
+            TradeData trade = {
+                price,
+                volume,
+                isBuyerMaker,
+                static_cast<time_t>(timestamp),
+                m_symbol
+            };
+            
+            // Invoke callback if registered
+            if (m_tickDataCallback) {
+                m_tickDataCallback(trade);
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR("Error extracting trade data: {}", e.what());
+        }
+    }
+    
+    // Run WebSocket client
+    void runWebSocketClient() {
+        LOG_INFO("Starting WebSocket client for {}", m_symbol);
+        
+        while (m_shouldRun) {
+            // Create libwebsockets context
+            struct lws_context_creation_info info = {};
+            struct lws_protocols protocols[] = {
+                { "ws", wsCallback, 0, 65536, 0, this },
+                { nullptr, nullptr, 0, 0, 0, nullptr }
+            };
+            
+            info.port = CONTEXT_PORT_NO_LISTEN;
+            info.protocols = protocols;
+            info.gid = -1;
+            info.uid = -1;
+            info.user = this;
+            
+            // Setup TLS if secure connection
+            if (m_isSecure) {
+                info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+            }
+            
+            // Create context
+            struct lws_context* context = lws_create_context(&info);
+            if (!context) {
+                LOG_ERROR("Failed to create WebSocket context for {}", m_symbol);
+                
+                // Exponential backoff for reconnection
+                if (++m_reconnectCount <= m_maxReconnectAttempts) {
+                    int delay = m_reconnectIntervalMs * (1 << (m_reconnectCount - 1));
+                    LOG_INFO("Retrying connection for {} in {}ms (attempt {}/{})", 
+                             m_symbol, delay, m_reconnectCount, m_maxReconnectAttempts);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                    continue;
+                } else {
+                    LOG_ERROR("Max reconnect attempts reached for {}", m_symbol);
+                    break;
+                }
+            }
+            
+            // Setup connection info
+            struct lws_client_connect_info ccinfo = {};
+            ccinfo.context = context;
+            ccinfo.address = m_host.c_str();
+            ccinfo.port = m_port;
+            ccinfo.path = m_path.c_str();
+            ccinfo.host = lws_canonical_hostname(context);
+            ccinfo.origin = m_host.c_str();
+            ccinfo.protocol = protocols[0].name;
+            
+            if (m_isSecure) {
+                ccinfo.ssl_connection = LCCSCF_USE_SSL | 
+                                       LCCSCF_ALLOW_SELFSIGNED | 
+                                       LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+            }
+            
+            // Connect to WebSocket server
+            struct lws* wsi = lws_client_connect_via_info(&ccinfo);
+            if (!wsi) {
+                LOG_ERROR("Failed to connect to WebSocket server for {}", m_symbol);
+                lws_context_destroy(context);
+                
+                // Exponential backoff for reconnection
+                if (++m_reconnectCount <= m_maxReconnectAttempts) {
+                    int delay = m_reconnectIntervalMs * (1 << (m_reconnectCount - 1));
+                    LOG_INFO("Retrying connection for {} in {}ms (attempt {}/{})", 
+                             m_symbol, delay, m_reconnectCount, m_maxReconnectAttempts);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                    continue;
+                } else {
+                    LOG_ERROR("Max reconnect attempts reached for {}", m_symbol);
+                    break;
+                }
+            }
+            
+            LOG_INFO("WebSocket connected for {}", m_symbol);
+            
+            // Service WebSocket connection
+            while (m_shouldRun && context) {
+                lws_service(context, 100);
+                
+                // If connection is lost, break to reconnect
+                if (!m_isConnected && m_shouldRun) {
+                    LOG_WARNING("WebSocket connection lost for {}, will reconnect", m_symbol);
+                    break;
+                }
+            }
+            
+            // Clean up context
+            if (context) {
+                lws_context_destroy(context);
+            }
+            
+            // If we should not run anymore, break
+            if (!m_shouldRun) {
+                break;
+            }
+            
+            // Exponential backoff for reconnection
+            if (++m_reconnectCount <= m_maxReconnectAttempts) {
+                int delay = m_reconnectIntervalMs * (1 << (m_reconnectCount - 1));
+                LOG_INFO("Reconnecting for {} in {}ms (attempt {}/{})", 
+                         m_symbol, delay, m_reconnectCount, m_maxReconnectAttempts);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            } else {
+                LOG_ERROR("Max reconnect attempts reached for {}", m_symbol);
+                break;
+            }
+        }
+        
+        LOG_INFO("WebSocket client stopped for {}", m_symbol);
+    }
+    
+    // WebSocket configuration
+    std::string m_url;
+    std::string m_host;
+    std::string m_path;
+    int m_port;
+    bool m_isSecure;
+    std::string m_symbol;
+    int m_reconnectIntervalMs;
+    int m_maxReconnectAttempts;
+    
+    // Connection state
+    std::atomic<bool> m_isConnected;
+    std::atomic<bool> m_shouldRun;
+    std::atomic<int> m_reconnectCount;
+    
+    // Threading
+    std::thread m_wsThread;
+    
+    // Callback
+    TickDataCallback m_tickDataCallback;
+};

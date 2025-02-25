@@ -1,0 +1,124 @@
+// config.h - Configuration management
+
+#pragma once
+
+#include <string>
+#include <vector>
+#include <map>
+#include <json/json.h>
+#include <memory>
+#include <stdexcept>
+#include <fstream>
+#include <sstream>
+
+// Timeframe configuration
+struct TimeframeConfig {
+    int minutes;
+    std::string kafkaTopic;
+};
+
+// Symbol configuration
+struct SymbolConfig {
+    std::string symbol;
+    std::string wsUrl;
+    std::vector<TimeframeConfig> timeframes;
+};
+
+// Main configuration class
+class Config {
+public:
+    Config(const std::string& configPath) {
+        loadFromFile(configPath);
+    }
+    
+    // Kafka configuration
+    std::string kafkaBroker;
+    std::string kafkaTopic;
+    std::map<std::string, std::string> kafkaConfig;
+    
+    // WebSocket configuration
+    int reconnectIntervalMs;
+    int maxReconnectAttempts;
+    
+    // Metrics configuration
+    int metricsIntervalSec;
+    
+    // Symbols configuration
+    std::vector<SymbolConfig> symbols;
+    
+    std::string toString() const {
+        std::stringstream ss;
+        ss << "Config {" << std::endl;
+        ss << "  kafkaBroker: " << kafkaBroker << std::endl;
+        ss << "  kafkaTopic: " << kafkaTopic << std::endl;
+        ss << "  reconnectIntervalMs: " << reconnectIntervalMs << std::endl;
+        ss << "  maxReconnectAttempts: " << maxReconnectAttempts << std::endl;
+        ss << "  metricsIntervalSec: " << metricsIntervalSec << std::endl;
+        ss << "  symbols: [" << std::endl;
+        for (const auto& symbol : symbols) {
+            ss << "    {" << std::endl;
+            ss << "      symbol: " << symbol.symbol << std::endl;
+            ss << "      wsUrl: " << symbol.wsUrl << std::endl;
+            ss << "      timeframes: [" << std::endl;
+            for (const auto& tf : symbol.timeframes) {
+                ss << "        { minutes: " << tf.minutes << ", topic: " << tf.kafkaTopic << " }," << std::endl;
+            }
+            ss << "      ]" << std::endl;
+            ss << "    }," << std::endl;
+        }
+        ss << "  ]" << std::endl;
+        ss << "}" << std::endl;
+        return ss.str();
+    }
+    
+private:
+    void loadFromFile(const std::string& configPath) {
+        std::ifstream file(configPath);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open config file: " + configPath);
+        }
+        
+        Json::Value root;
+        Json::CharReaderBuilder reader;
+        std::string errors;
+        
+        if (!Json::parseFromStream(reader, file, &root, &errors)) {
+            throw std::runtime_error("Failed to parse config file: " + errors);
+        }
+        
+        // Load Kafka configuration
+        kafkaBroker = root["kafka"]["broker"].asString();
+        kafkaTopic = root["kafka"]["topic"].asString();
+        
+        // Load Kafka additional config
+        const Json::Value& kafkaAdditionalConfig = root["kafka"]["config"];
+        for (const auto& key : kafkaAdditionalConfig.getMemberNames()) {
+            kafkaConfig[key] = kafkaAdditionalConfig[key].asString();
+        }
+        
+        // Load WebSocket configuration
+        reconnectIntervalMs = root["websocket"]["reconnectIntervalMs"].asInt();
+        maxReconnectAttempts = root["websocket"]["maxReconnectAttempts"].asInt();
+        
+        // Load metrics configuration
+        metricsIntervalSec = root["metrics"]["intervalSec"].asInt();
+        
+        // Load symbols configuration
+        const Json::Value& symbolsConfig = root["symbols"];
+        for (const auto& symbolConfig : symbolsConfig) {
+            SymbolConfig config;
+            config.symbol = symbolConfig["symbol"].asString();
+            config.wsUrl = symbolConfig["wsUrl"].asString();
+            
+            const Json::Value& timeframesConfig = symbolConfig["timeframes"];
+            for (const auto& tfConfig : timeframesConfig) {
+                TimeframeConfig tf;
+                tf.minutes = tfConfig["minutes"].asInt();
+                tf.kafkaTopic = tfConfig["topic"].asString();
+                config.timeframes.push_back(tf);
+            }
+            
+            symbols.push_back(config);
+        }
+    }
+};

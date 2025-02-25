@@ -1,0 +1,238 @@
+// kafka_producer.h - Kafka producer interface
+
+#pragma once
+
+#include "logging.h"
+#include "metrics.h"
+
+#include <string>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <queue>
+#include <atomic>
+#include <condition_variable>
+#include <librdkafka/rdkafka.h>
+
+// Message for Kafka queue
+struct KafkaMessage {
+    std::string topic;
+    std::string key;
+    std::string message;
+    
+    KafkaMessage(const std::string& t, const std::string& k, const std::string& m)
+        : topic(t), key(k), message(m) {}
+};
+
+// Kafka producer class with reliable delivery
+class KafkaProducer {
+public:
+    KafkaProducer(const std::string& broker, 
+                 const std::string& defaultTopic,
+                 const std::map<std::string, std::string>& config = {})
+        : m_broker(broker),
+          m_defaultTopic(defaultTopic),
+          m_running(false),
+          m_deliveryReports(0),
+          m_messageSent(0),
+          m_messageErrors(0)
+    {
+        // Start worker thread
+        init(config);
+    }
+    
+    ~KafkaProducer() {
+        stop();
+    }
+    
+    // Send message to default topic
+    void send(const std::string& message, const std::string& key = "") {
+        send(m_defaultTopic, message, key);
+    }
+    
+    // Send message to specific topic
+    void send(const std::string& topic, const std::string& message, const std::string& key = "") {
+        if (!m_running) {
+            LOG_ERROR("Kafka producer not running, message not sent to topic {}", topic);
+            return;
+        }
+        
+        // Queue message for async sending
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_messageQueue.emplace(topic, key, message);
+        }
+        
+        // Notify worker thread
+        m_queueCondition.notify_one();
+    }
+    
+    // Stop producer
+    void stop() {
+        if (!m_running) {
+            return;
+        }
+        
+        LOG_INFO("Stopping Kafka producer");
+        m_running = false;
+        
+        // Notify worker thread
+        m_queueCondition.notify_one();
+        
+        // Wait for worker thread to finish
+        if (m_workerThread.joinable()) {
+            m_workerThread.join();
+        }
+        
+        // Flush and destroy producer
+        if (m_producer) {
+            rd_kafka_flush(m_producer.get(), 30000);
+            m_producer.reset();
+        }
+        
+        LOG_INFO("Kafka producer stopped");
+    }
+    
+    // Get metrics
+    void getMetrics(Metrics& metrics) const {
+        metrics.recordCounter("kafka_messages_sent", m_messageSent);
+        metrics.recordCounter("kafka_messages_errors", m_messageErrors);
+        metrics.recordCounter("kafka_delivery_reports", m_deliveryReports);
+        metrics.recordGauge("kafka_queue_size", m_messageQueue.size());
+    }
+    
+private:
+    // Initialize Kafka producer
+    void init(const std::map<std::string, std::string>& config) {
+        LOG_INFO("Initializing Kafka producer for broker {}", m_broker);
+        
+        // Create Kafka configuration
+        rd_kafka_conf_t* conf = rd_kafka_conf_new();
+        
+        // Set default configuration
+        char errstr[512];
+        if (rd_kafka_conf_set(conf, "bootstrap.servers", m_broker.c_str(), 
+                              errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+            LOG_ERROR("Kafka config error: {}", errstr);
+            rd_kafka_conf_destroy(conf);
+            throw std::runtime_error("Failed to configure Kafka: " + std::string(errstr));
+        }
+        
+        // Set delivery report callback
+        rd_kafka_conf_set_dr_msg_cb(conf, deliveryReportCallback);
+        
+        // Apply additional configuration
+        for (const auto& entry : config) {
+            if (rd_kafka_conf_set(conf, entry.first.c_str(), entry.second.c_str(), 
+                                 errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+                LOG_WARNING("Kafka config warning for {}: {}", entry.first, errstr);
+            }
+        }
+        
+        // Set opaque pointer to this instance
+        rd_kafka_conf_set_opaque(conf, this);
+        
+        // Create producer
+        rd_kafka_t* producer = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+        if (!producer) {
+            LOG_ERROR("Failed to create Kafka producer: {}", errstr);
+            rd_kafka_conf_destroy(conf);
+            throw std::runtime_error("Failed to create Kafka producer: " + std::string(errstr));
+        }
+        
+        // Store producer in smart pointer with custom deleter
+        m_producer = std::shared_ptr<rd_kafka_t>(producer, [](rd_kafka_t* p) {
+            rd_kafka_destroy(p);
+        });
+        
+        LOG_INFO("Kafka producer initialized");
+        
+        // Start worker thread
+        m_running = true;
+        m_workerThread = std::thread(&KafkaProducer::workerThread, this);
+    }
+    
+    // Worker thread for async message sending
+    void workerThread() {
+        LOG_INFO("Kafka producer worker thread started");
+        
+        while (m_running) {
+            // Get next message from queue
+            KafkaMessage msg{"", "", ""};
+            bool hasMessage = false;
+            
+            {
+                std::unique_lock<std::mutex> lock(m_queueMutex);
+                m_queueCondition.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return !m_running || !m_messageQueue.empty();
+                });
+                
+                if (!m_running && m_messageQueue.empty()) {
+                    break;
+                }
+                
+                if (!m_messageQueue.empty()) {
+                    msg = m_messageQueue.front();
+                    m_messageQueue.pop();
+                    hasMessage = true;
+                }
+            }
+            
+            // Send message if available
+            if (hasMessage) {
+                sendMessage(msg.topic, msg.message, msg.key);
+            }
+            
+            // Poll for events (delivery reports)
+            rd_kafka_poll(m_producer.get(), 0);
+        }
+        
+        LOG_INFO("Kafka producer worker thread stopping");
+        
+        // Process remaining messages in queue
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            while (!m_messageQueue.empty()) {
+                KafkaMessage msg = m_messageQueue.front();
+                m_messageQueue.pop();
+                sendMessage(msg.topic, msg.message, msg.key);
+            }
+        }
+        
+        LOG_INFO("Kafka producer worker thread stopped");
+    }
+    
+    // Send message directly to Kafka
+    void sendMessage(const std::string& topic, const std::string& message, const std::string& key) {
+        // Get or create topic handle
+        rd_kafka_topic_t* kafkaTopic = getOrCreateTopic(topic);
+        if (!kafkaTopic) {
+            LOG_ERROR("Failed to create Kafka topic: {}", topic);
+            ++m_messageErrors;
+            return;
+        }
+        
+        // Produce message
+        int result = rd_kafka_produce(
+            kafkaTopic,
+            RD_KAFKA_PARTITION_UA,  // Use librdkafka's partitioner
+            RD_KAFKA_MSG_F_COPY,    // Make a copy of the payload
+            const_cast<char*>(message.c_str()),
+            message.size(),
+            key.empty() ? NULL : key.c_str(),
+            key.empty() ? 0 : key.size(),
+            nullptr  // Message opaque
+        );
+        
+        if (result == -1) {
+            rd_kafka_resp_err_t err = rd_kafka_last_error();
+            LOG_ERROR("Failed to produce message to topic {}: {}", 
+                      topic, rd_kafka_err2str(err));
+            ++m_messageErrors;
+            
+            // Handle queue full by retrying
+            if (err == RD_KAFKA_RESP_ERR__QUEUE_FULL) {
+                LOG_WARNING("Kafka queue full, retrying message delivery to {}", topic);
+                
+                // Poll to
