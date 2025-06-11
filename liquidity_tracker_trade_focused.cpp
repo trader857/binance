@@ -52,12 +52,13 @@ LiquidityTracker::LiquidityTracker(double buy_bucket_size_usd,
 LiquidityTracker::~LiquidityTracker() {
 }
 
+// FIXED: Only store order book for cancel detection, don't trigger buckets
 void LiquidityTracker::onOrderBookUpdate(
     uint64_t timestamp_ns,
     const std::vector<OrderBookLevel>& bids,
     const std::vector<OrderBookLevel>& asks) {
     
-    // Store previous state for change detection
+    // Store previous state for cancel detection only
     std::map<double, double> prev_bids = last_bids_volume_;
     std::map<double, double> prev_asks = last_asks_volume_;
     
@@ -77,17 +78,23 @@ void LiquidityTracker::onOrderBookUpdate(
         last_asks_volume_[rounded_price] = asks[i].volume;
     }
     
-    // Detect liquidity changes
+    // ONLY detect cancellations and liquidity changes for monitoring
+    // Do NOT trigger buy/sell buckets here
     detectLiquidityChanges(timestamp_ns, prev_bids, prev_asks);
 }
 
+// FIXED: This is where actual liquidity consumption happens
 void LiquidityTracker::onTrade(const TradeMessageBinary& trade) {
     double trade_value_usd = trade.price * trade.quantity;
     bool is_buy = trade.is_buy();
     
-    // Accumulate buy/sell flow in buckets
+    std::cout << "[" << format_timestamp(trade.timestamp_ns) << "] "
+              << "[TRADE FLOW] " << (is_buy ? "BUY" : "SELL") << " $" 
+              << std::fixed << std::setprecision(2) << trade_value_usd << std::endl;
+    
+    // Accumulate based on trade direction (actual liquidity consumption)
     if (is_buy) {
-        // Initialize start time if this is the first trade in bucket
+        // BUY trade consumes ASK liquidity
         if (buy_start_ts_ns_ == 0) {
             buy_start_ts_ns_ = trade.timestamp_ns;
         }
@@ -111,7 +118,7 @@ void LiquidityTracker::onTrade(const TradeMessageBinary& trade) {
             buy_start_ts_ns_ = 0;
         }
     } else {
-        // Initialize start time if this is the first trade in bucket
+        // SELL trade consumes BID liquidity
         if (sell_start_ts_ns_ == 0) {
             sell_start_ts_ns_ = trade.timestamp_ns;
         }
@@ -191,12 +198,13 @@ double LiquidityTracker::round_price(double price) const {
     return std::round(price / tick_size_) * tick_size_;
 }
 
+// FIXED: Only detect cancellations, not trigger trade buckets
 void LiquidityTracker::detectLiquidityChanges(
     uint64_t timestamp_ns,
     const std::map<double, double>& prev_bids,
     const std::map<double, double>& prev_asks) {
     
-    // Detect changes in bids
+    // Detect changes in bids - ONLY for cancel detection
     for (const auto& [price, volume] : last_bids_volume_) {
         auto prev_it = prev_bids.find(price);
         double prev_volume = (prev_it != prev_bids.end()) ? prev_it->second : 0.0;
@@ -206,9 +214,14 @@ void LiquidityTracker::detectLiquidityChanges(
             
             // If volume decreased significantly, it might be a cancel
             if (volume_delta < -prev_volume * 0.5 && prev_volume > 0) {
+                std::cout << "[" << format_timestamp(timestamp_ns) << "] "
+                          << "[CANCEL DETECTED] BID at $" << std::fixed << std::setprecision(2) << price
+                          << ", cancelled: " << std::setprecision(4) << std::abs(volume_delta)
+                          << " ($" << std::setprecision(2) << (std::abs(volume_delta) * price) << ")" << std::endl;
                 processCancelVolumeInternal(true, std::abs(volume_delta) * price, timestamp_ns);
             }
             
+            // Optional: Still notify about liquidity changes for monitoring
             if (liquidity_change_cb_) {
                 LiquidityChange change{price, volume_delta, timestamp_ns, true};
                 liquidity_change_cb_(change);
@@ -216,7 +229,7 @@ void LiquidityTracker::detectLiquidityChanges(
         }
     }
     
-    // Detect changes in asks
+    // Detect changes in asks - ONLY for cancel detection
     for (const auto& [price, volume] : last_asks_volume_) {
         auto prev_it = prev_asks.find(price);
         double prev_volume = (prev_it != prev_asks.end()) ? prev_it->second : 0.0;
@@ -226,9 +239,14 @@ void LiquidityTracker::detectLiquidityChanges(
             
             // If volume decreased significantly, it might be a cancel
             if (volume_delta < -prev_volume * 0.5 && prev_volume > 0) {
+                std::cout << "[" << format_timestamp(timestamp_ns) << "] "
+                          << "[CANCEL DETECTED] ASK at $" << std::fixed << std::setprecision(2) << price
+                          << ", cancelled: " << std::setprecision(4) << std::abs(volume_delta)
+                          << " ($" << std::setprecision(2) << (std::abs(volume_delta) * price) << ")" << std::endl;
                 processCancelVolumeInternal(false, std::abs(volume_delta) * price, timestamp_ns);
             }
             
+            // Optional: Still notify about liquidity changes for monitoring
             if (liquidity_change_cb_) {
                 LiquidityChange change{price, volume_delta, timestamp_ns, false};
                 liquidity_change_cb_(change);
